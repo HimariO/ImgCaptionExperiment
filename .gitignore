@@ -1,0 +1,9 @@
+data/
+model/
+train2014/
+annotations/
+PreProcess/
+*.pyc
+*.npy
+*.jpg
+*.png
