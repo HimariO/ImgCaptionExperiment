@@ -13,16 +13,18 @@ import tensorflow.python.platform
 from keras.preprocessing import sequence
 
 from termcolor import colored
+from make_coco_dataset import CocoDataSet
+
 
 class Caption_Generator():
 
     def init_weight(self, dim_in, dim_out, name=None, stddev=1.0):
-        return tf.Variable(tf.truncated_normal([dim_in, dim_out], stddev=stddev/math.sqrt(float(dim_in))), name=name)
+        return tf.Variable(tf.truncated_normal([dim_in, dim_out], stddev=stddev / math.sqrt(float(dim_in))), name=name)
 
     def init_bias(self, dim_out, name=None):
         return tf.Variable(tf.zeros([dim_out]), name=name)
 
-    def __init__(self, n_words, dim_embed, dim_ctx, dim_hidden, n_lstm_steps, batch_size=200, ctx_shape=[196,512], bias_init_vector=None):
+    def __init__(self, n_words, dim_embed, dim_ctx, dim_hidden, n_lstm_steps, batch_size=200, ctx_shape=[196, 512], bias_init_vector=None):
         self.n_words = n_words
         self.dim_embed = dim_embed
         self.dim_ctx = dim_ctx
@@ -97,11 +99,8 @@ class Caption_Generator():
             labels = tf.expand_dims(sentence[:, ind], 1)
             indices = tf.expand_dims(tf.range(0, self.batch_size, 1), 1)
             concated = tf.concat(1, [indices, labels])
-            onehot_labels = tf.sparse_to_dense( concated, tf.pack([self.batch_size, self.n_words]), 1.0, 0.0)
-
-            context_encode = context_encode + \
-                 tf.expand_dims(tf.matmul(h, self.hidden_att_W), 1) + \
-                 self.pre_att_b
+            onehot_labels = tf.sparse_to_dense(concated, tf.pack([self.batch_size, self.n_words]), 1.0, 0.0)
+            context_encode = context_encode + tf.expand_dims(tf.matmul(h, self.hidden_att_W), 1) + self.pre_att_b
 
             context_encode = tf.nn.tanh(context_encode)
 
@@ -109,7 +108,7 @@ class Caption_Generator():
             context_encode_flat = tf.reshape(context_encode, [-1, self.dim_ctx])  # (batch_size*196, 512)
             alpha = tf.matmul(context_encode_flat, self.att_W) + self.att_b  # (batch_size*196, 1)
             alpha = tf.reshape(alpha, [-1, self.ctx_shape[0]])
-            alpha = tf.nn.softmax( alpha )
+            alpha = tf.nn.softmax(alpha)
 
             weighted_context = tf.reduce_sum(context * tf.expand_dims(alpha, 2), 1)
 
@@ -300,13 +299,13 @@ def train_filck(pretrained_model_path=pretrained_model_path):  # 전에 학습�
         saver.save(sess, os.path.join(model_path, 'model'), global_step=epoch)
 
 
-def train_coco(pretrained_model_path=pretrained_model_path):  # 전에 학습하던게 있으면 초기값 설정.
+def train_coco(pretrained_model_path=pretrained_model_path, annotation_path='./annotations/captions_train2014.json'):  # 전에 학습하던게 있으면 초기값 설정.
     annotation_data = None
     with open(annotation_path, 'r') as json_file:
         annotation_data = json.loads(json_file.read())
 
     captions = map(lambda x: x['caption'], annotation_data['annotations'])
-    wordtoix, ixtoword, bias_init_vector = preProBuildWordVocab(captions)
+    wordtoix, ixtoword, bias_init_vector = preProBuildWordVocab(captions)  # one-hot encode for caption... not sure
 
     learning_rate = 0.001
     n_words = len(wordtoix)
@@ -333,39 +332,28 @@ def train_coco(pretrained_model_path=pretrained_model_path):  # 전에 학습하
             print("Starting with pretrained model")
             saver.restore(sess, pretrained_model_path)
 
-        index = list(annotation_data.index)
-        np.random.shuffle(index)
-        annotation_data = annotation_data.ix[index]
+        for feats, caps, ids in CocoDataSet(batch_size=batch_size):
+            current_feats = feats
+            current_feats = current_feats.reshape(-1, ctx_shape[1], ctx_shape[0]).swapaxes(1, 2)
 
-        captions = annotation_data['caption'].values
-        image_id = annotation_data['image_id'].values
+            current_captions = caps
+            current_caption_ind = map(lambda cap: [wordtoix[word] for word in cap.lower().split(' ')[:-1] if word in wordtoix], current_captions)  # '.'은 제거
 
-        for epoch in range(n_epochs):
-            for start, end in zip(
-                    range(0, len(captions), batch_size),
-                    range(batch_size, len(captions), batch_size)):
+            current_caption_matrix = sequence.pad_sequences(current_caption_ind, padding='post', maxlen=maxlen + 1)
 
-                current_feats = feats[ image_id[start:end] ]
-                current_feats = current_feats.reshape(-1, ctx_shape[1], ctx_shape[0]).swapaxes(1, 2)
+            current_mask_matrix = np.zeros((current_caption_matrix.shape[0], current_caption_matrix.shape[1]))
+            nonzeros = np.array(map(lambda x: (x != 0).sum() + 1, current_caption_matrix))
 
-                current_captions = captions[start:end]
-                current_caption_ind = map(lambda cap: [wordtoix[word] for word in cap.lower().split(' ')[:-1] if word in wordtoix], current_captions)  # '.'은 제거
+            for ind, row in enumerate(current_mask_matrix):
+                row[:nonzeros[ind]] = 1
 
-                current_caption_matrix = sequence.pad_sequences(current_caption_ind, padding='post', maxlen=maxlen + 1)
+            _, loss_value = sess.run([train_op, loss], feed_dict={
+                context: current_feats,
+                sentence: current_caption_matrix,
+                mask: current_mask_matrix})
 
-                current_mask_matrix = np.zeros((current_caption_matrix.shape[0], current_caption_matrix.shape[1]))
-                nonzeros = np.array( map(lambda x: (x != 0).sum() + 1, current_caption_matrix ))
-
-                for ind, row in enumerate(current_mask_matrix):
-                    row[:nonzeros[ind]] = 1
-
-                _, loss_value = sess.run([train_op, loss], feed_dict={
-                    context: current_feats,
-                    sentence: current_caption_matrix,
-                    mask: current_mask_matrix})
-
-                print("Epoch ", colored(epoch, colored='yellow'), " finished. Current Cost: ", colored(loss_value, color='red'))
-            saver.save(sess, os.path.join(model_path, 'model'), global_step=epoch)
+            print("Epoch ", colored(epoch, colored='yellow'), " finished. Current Cost: ", colored(loss_value, color='red'))
+        saver.save(sess, os.path.join(model_path, 'model'), global_step=epoch)
 
 
 def test_flick(test_feat='./guitar_player.npy', model_path='./model/model-6', maxlen=20):
